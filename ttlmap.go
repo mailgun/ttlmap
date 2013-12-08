@@ -7,111 +7,172 @@ import (
 	"time"
 )
 
-type mapItem struct {
-	key    string
-	el     interface{}
-	heapEl *minheap.Element
-}
-
 type TtlMap struct {
 	capacity     int
-	items        map[string]*mapItem
+	elements     map[string]*mapElement
 	expiryTimes  *minheap.MinHeap
 	timeProvider timetools.TimeProvider
 }
 
+type mapElement struct {
+	key    string
+	value  interface{}
+	heapEl *minheap.Element
+}
+
 func NewMap(capacity int) (*TtlMap, error) {
+	return NewMapWithProvider(capacity, &timetools.RealTime{})
+}
+
+func NewMapWithProvider(capacity int, timeProvider timetools.TimeProvider) (*TtlMap, error) {
 	if capacity <= 0 {
 		return nil, fmt.Errorf("Capacity should be >= 0")
 	}
+	if timeProvider == nil {
+		return nil, fmt.Errorf("Please pass timeProvider")
+	}
 
 	return &TtlMap{
-		capacity:    capacity,
-		items:       make(map[string]*mapItem),
-		expiryTimes: minheap.NewMinHeap(),
+		capacity:     capacity,
+		elements:     make(map[string]*mapElement),
+		expiryTimes:  minheap.NewMinHeap(),
+		timeProvider: timeProvider,
 	}, nil
 }
 
-func (m *TtlMap) Set(key string, el interface{}, ttlSeconds int) {
-	if len(m.items) > m.capacity {
-		m.freeSpace(1)
+func (m *TtlMap) Set(key string, value interface{}, ttlSeconds int) error {
+	expiryTime, err := m.toEpochSeconds(ttlSeconds)
+	if err != nil {
+		return err
 	}
 
-	expiryTime := int(m.timeProvider.UtcNow().Add(time.Second * time.Duration(ttlSeconds)).Unix())
-	item, exists := m.items[key]
+	mapEl, exists := m.elements[key]
 	if !exists {
+		if len(m.elements) >= m.capacity {
+			m.freeSpace(1)
+		}
 		heapEl := &minheap.Element{
 			Priority: expiryTime,
 		}
-		mapItem := &mapItem{
+		mapEl := &mapElement{
 			key:    key,
-			el:     el,
+			value:  value,
 			heapEl: heapEl,
 		}
-		heapEl.Value = mapItem
-		m.items[key] = mapItem
+		heapEl.Value = mapEl
+		m.elements[key] = mapEl
 		m.expiryTimes.PushEl(heapEl)
 	} else {
-		item.el = el
-		m.expiryTimes.UpdateEl(item.heapEl, expiryTime)
+		mapEl.value = value
+		m.expiryTimes.UpdateEl(mapEl.heapEl, expiryTime)
 	}
+	return nil
+}
+
+func (m *TtlMap) toEpochSeconds(ttlSeconds int) (int, error) {
+	if ttlSeconds <= 0 {
+		return 0, fmt.Errorf("ttlSeconds should be >= 0, got %d", ttlSeconds)
+	}
+	return int(m.timeProvider.UtcNow().Add(time.Second * time.Duration(ttlSeconds)).Unix()), nil
+}
+
+func (m *TtlMap) Len() int {
+	return len(m.elements)
 }
 
 func (m *TtlMap) Get(key string) (interface{}, bool) {
-	item, exists := m.items[key]
+	mapEl, exists := m.elements[key]
 	if !exists {
-		return item, exists
-	}
-	if m.expireItem(item) {
 		return nil, false
 	}
-	return item.el, true
+	if m.expireElement(mapEl) {
+		return nil, false
+	}
+	return mapEl.value, true
 }
 
-func (m *TtlMap) expireItem(item *mapItem) bool {
+func (m *TtlMap) Increment(key string, value int, ttlSeconds int) (int, error) {
+	expiryTime, err := m.toEpochSeconds(ttlSeconds)
+	if err != nil {
+		return 0, err
+	}
+
+	mapEl, exists := m.elements[key]
+	if !exists {
+		m.Set(key, value, ttlSeconds)
+		return value, nil
+	}
+	if m.expireElement(mapEl) {
+		m.Set(key, value, ttlSeconds)
+		return value, nil
+	}
+	currentValue, ok := mapEl.value.(int)
+	if !ok {
+		return 0, fmt.Errorf("Expected existing value to be integer, got %T", mapEl.value)
+	}
+	currentValue += value
+	mapEl.value = currentValue
+
+	m.expiryTimes.UpdateEl(mapEl.heapEl, expiryTime)
+	return currentValue, nil
+}
+
+func (m *TtlMap) GetInt(key string) (int, bool, error) {
+	valueI, exists := m.Get(key)
+	if !exists {
+		return 0, false, nil
+	}
+	value, ok := valueI.(int)
+	if !ok {
+		return 0, false, fmt.Errorf("Expected existing value to be integer, got %T", valueI)
+	}
+	return value, true, nil
+}
+
+func (m *TtlMap) expireElement(mapEl *mapElement) bool {
 	now := int(m.timeProvider.UtcNow().Unix())
-	if item.heapEl.Priority > now {
+	if mapEl.heapEl.Priority > now {
 		return false
 	}
-	delete(m.items, item.key)
-	m.expiryTimes.RemoveEl(item.heapEl)
+	delete(m.elements, mapEl.key)
+	m.expiryTimes.RemoveEl(mapEl.heapEl)
 	return true
 }
 
-func (m *TtlMap) freeSpace(items int) {
-	removed := m.removeExpiredItems(items)
-	if removed >= items {
+func (m *TtlMap) freeSpace(count int) {
+	removed := m.removeExpired(count)
+	if removed >= count {
 		return
 	}
-	m.removeLeastUsedItems(items)
+	m.removeLastUsed(count - removed)
 }
 
-func (m *TtlMap) removeExpiredItems(iterations int) int {
+func (m *TtlMap) removeExpired(iterations int) int {
 	removed := 0
 	now := int(m.timeProvider.UtcNow().Unix())
 	for i := 0; i < iterations; i += 1 {
-		if len(m.items) == 0 {
+		if len(m.elements) == 0 {
 			break
 		}
-		heapItem := m.expiryTimes.PeekEl()
-		if heapItem.Priority > now {
+		heapEl := m.expiryTimes.PeekEl()
+		if heapEl.Priority > now {
 			break
 		}
 		m.expiryTimes.PopEl()
-		mapItem := heapItem.Value.(*mapItem)
-		delete(m.items, mapItem.key)
+		mapEl := heapEl.Value.(*mapElement)
+		delete(m.elements, mapEl.key)
 		removed += 1
 	}
 	return removed
 }
 
-func (m *TtlMap) removeLeastUsedItems(iterations int) {
+func (m *TtlMap) removeLastUsed(iterations int) {
 	for i := 0; i < iterations; i += 1 {
-		if len(m.items) == 0 {
+		if len(m.elements) == 0 {
 			return
 		}
-		heapItem := m.expiryTimes.PopEl()
-		mapItem := heapItem.Value.(*mapItem)
-		delete(m.items, mapItem.key)
+		heapEl := m.expiryTimes.PopEl()
+		mapEl := heapEl.Value.(*mapElement)
+		delete(m.elements, mapEl.key)
 	}
 }

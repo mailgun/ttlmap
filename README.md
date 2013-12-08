@@ -15,5 +15,4 @@ valI, exists := mh.Get("key2")
 if exists {
    val := valI.(string)
 }
-
 ```
