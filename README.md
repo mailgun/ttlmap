@@ -1,4 +1,5 @@
 [![Build Status](https://drone.io/github.com/mailgun/minheap/status.png)](https://drone.io/github.com/mailgun/minheap/latest)
+[![Build Status](https://travis-ci.org/mailgun/ttlmap.png)](https://travis-ci.org/mailgun/ttlmap)
 
 TtlMap
 =======
