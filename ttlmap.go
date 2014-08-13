@@ -26,7 +26,7 @@ func NewMap(capacity int) (*TtlMap, error) {
 
 func NewMapWithProvider(capacity int, timeProvider timetools.TimeProvider) (*TtlMap, error) {
 	if capacity <= 0 {
-		return nil, fmt.Errorf("Capacity should be >= 0")
+		return nil, fmt.Errorf("Capacity should be > 0")
 	}
 	if timeProvider == nil {
 		return nil, fmt.Errorf("Please pass timeProvider")
