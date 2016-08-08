@@ -2,6 +2,7 @@ package ttlmap
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/mailgun/minheap"
@@ -35,6 +36,8 @@ type TtlMap struct {
 	TimeProvider timetools.TimeProvider
 	// onExpire callback will be called when element is expired
 	onExpire Callback
+	// Mutex to keep things thread safe
+	lock *sync.RWMutex
 }
 
 type mapElement struct {
@@ -52,6 +55,7 @@ func NewMap(capacity int, opts ...TtlMapOption) (*TtlMap, error) {
 		capacity:    capacity,
 		elements:    make(map[string]*mapElement),
 		expiryTimes: minheap.NewMinHeap(),
+		lock:        &sync.RWMutex{},
 	}
 
 	for _, o := range opts {
@@ -75,6 +79,10 @@ func NewMapWithProvider(capacity int, timeProvider timetools.TimeProvider) (*Ttl
 }
 
 func (m *TtlMap) Set(key string, value interface{}, ttlSeconds int) error {
+	// Lock for writes
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
 	expiryTime, err := m.toEpochSeconds(ttlSeconds)
 	if err != nil {
 		return err
@@ -103,26 +111,29 @@ func (m *TtlMap) Set(key string, value interface{}, ttlSeconds int) error {
 	return nil
 }
 
-func (m *TtlMap) toEpochSeconds(ttlSeconds int) (int, error) {
-	if ttlSeconds <= 0 {
-		return 0, fmt.Errorf("ttlSeconds should be >= 0, got %d", ttlSeconds)
-	}
-	return int(m.TimeProvider.UtcNow().Add(time.Second * time.Duration(ttlSeconds)).Unix()), nil
-}
-
 func (m *TtlMap) Len() int {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
 	return len(m.elements)
 }
 
 func (m *TtlMap) Get(key string) (interface{}, bool) {
-	mapEl, exists := m.elements[key]
+	mapEl, exists := m.get(key)
 	if !exists {
 		return nil, false
 	}
-	if m.expireElement(mapEl) {
+	if m.shouldExpire(mapEl) {
+		m.expireElement(mapEl)
 		return nil, false
 	}
 	return mapEl.value, true
+}
+
+func (m *TtlMap) get(key string) (*mapElement, bool) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	mapEl, exists := m.elements[key]
+	return mapEl, exists
 }
 
 func (m *TtlMap) Increment(key string, value int, ttlSeconds int) (int, error) {
@@ -131,15 +142,22 @@ func (m *TtlMap) Increment(key string, value int, ttlSeconds int) (int, error) {
 		return 0, err
 	}
 
-	mapEl, exists := m.elements[key]
+	mapEl, exists := m.get(key)
 	if !exists {
 		m.Set(key, value, ttlSeconds)
 		return value, nil
 	}
-	if m.expireElement(mapEl) {
+	if m.shouldExpire(mapEl) {
 		m.Set(key, value, ttlSeconds)
 		return value, nil
 	}
+	return m.increment(mapEl, value, expiryTime)
+}
+
+func (m *TtlMap) increment(mapEl *mapElement, value int, expiryTime int) (int, error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
 	currentValue, ok := mapEl.value.(int)
 	if !ok {
 		return 0, fmt.Errorf("Expected existing value to be integer, got %T", mapEl.value)
@@ -164,10 +182,8 @@ func (m *TtlMap) GetInt(key string) (int, bool, error) {
 }
 
 func (m *TtlMap) expireElement(mapEl *mapElement) bool {
-	now := int(m.TimeProvider.UtcNow().Unix())
-	if mapEl.heapEl.Priority > now {
-		return false
-	}
+	m.lock.Lock()
+	defer m.lock.Unlock()
 
 	if m.onExpire != nil {
 		m.onExpire(mapEl.key, mapEl.value)
@@ -176,6 +192,21 @@ func (m *TtlMap) expireElement(mapEl *mapElement) bool {
 	delete(m.elements, mapEl.key)
 	m.expiryTimes.RemoveEl(mapEl.heapEl)
 	return true
+}
+
+func (m *TtlMap) shouldExpire(mapEl *mapElement) bool {
+	return mapEl.heapEl.Priority <= m.now()
+}
+
+func (m *TtlMap) now() int {
+	return int(m.TimeProvider.UtcNow().Unix())
+}
+
+func (m *TtlMap) toEpochSeconds(ttlSeconds int) (int, error) {
+	if ttlSeconds <= 0 {
+		return 0, fmt.Errorf("ttlSeconds should be >= 0, got %d", ttlSeconds)
+	}
+	return int(m.TimeProvider.UtcNow().Add(time.Second * time.Duration(ttlSeconds)).Unix()), nil
 }
 
 func (m *TtlMap) freeSpace(count int) {
@@ -188,7 +219,7 @@ func (m *TtlMap) freeSpace(count int) {
 
 func (m *TtlMap) removeExpired(iterations int) int {
 	removed := 0
-	now := int(m.TimeProvider.UtcNow().Unix())
+	now := m.now()
 	for i := 0; i < iterations; i += 1 {
 		if len(m.elements) == 0 {
 			break
