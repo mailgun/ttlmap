@@ -185,6 +185,11 @@ func (m *TtlMap) expireElement(mapEl *mapElement) bool {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	// Ensure key hasn't already been removed by another thread
+	if _, exists := m.elements[mapEl.key]; !exists {
+		return false
+	}
+
 	if m.onExpire != nil {
 		m.onExpire(mapEl.key, mapEl.value)
 	}
