@@ -23,7 +23,7 @@ func (s *TestSuite) SetUpTest(c *C) {
 
 func (s *TestSuite) newMap(capacity int, opts ...TtlMapOption) *TtlMap {
 	opts = append(opts, Clock(s.timeProvider))
-	m, err := NewMap(capacity, opts...)
+	m, err := NewConcurrent(capacity, opts...)
 	if err != nil {
 		panic(err)
 	}
